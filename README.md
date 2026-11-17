@@ -6,7 +6,9 @@ A layout for the [Herdr](https://herdr.dev) desktop app, built for running many 
 
 [![The main-craft layout](preview.png)](media/sho-herdr-mode.mp4)
 
-▶ **[Watch the 1-minute video](media/sho-herdr-mode.mp4)** (MP4, 5 MB, captions in Spanish).
+▶ **The 1-minute video** (captions in Spanish; also in [`media/sho-herdr-mode.mp4`](media/sho-herdr-mode.mp4)):
+
+https://github.com/user-attachments/assets/18538c3a-fcef-483b-818d-659cd21fbac6
 
 ![The layout taken apart: spaces, agents, CI and localhost on the left, tabs on top, panes in the middle, the panels on the right](media/layout.gif)
 

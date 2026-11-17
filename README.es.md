@@ -6,7 +6,9 @@ Un layout para la app de escritorio de [Herdr](https://herdr.dev), pensado para 
 
 [![El layout main-craft](preview.png)](media/sho-herdr-mode.mp4)
 
-▶ **[Mira el video de 1 minuto](media/sho-herdr-mode.mp4)** (MP4, 5 MB, en español).
+▶ **El video de 1 minuto** (en español; también está en [`media/sho-herdr-mode.mp4`](media/sho-herdr-mode.mp4)):
+
+https://github.com/user-attachments/assets/18538c3a-fcef-483b-818d-659cd21fbac6
 
 ![El layout desarmado en sus partes](media/layout.gif)
 
