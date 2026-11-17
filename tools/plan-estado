@@ -1,0 +1,457 @@
+#!/usr/bin/python3
+# plan-estado: unica forma de escribir el estado de los planes (estado.json y decisiones.json).
+# Python 3.9, solo biblioteca estandar.
+import datetime
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from contextlib import contextmanager
+
+USO = """plan-estado: escribe el estado de los planes (no edites el JSON a mano)
+
+Uso:
+  plan-estado <paquete> <unidad> campo=valor...      actualiza una unidad
+  plan-estado <paquete> --nueva <unidad> "<titulo>" [campo=valor...]
+  plan-estado <paquete> --crear "<titulo>"           crea estado.json
+  plan-estado <paquete> --cerrar                     marca el paquete como cerrado
+  plan-estado decision <url> pendiente|decidida "<titulo>" [paquete=...] [nota="..."]
+  plan-estado ver [<paquete>]                        imprime el estado en texto
+  plan-estado ... --on <maquina>                     lo corre en otra maquina (hc exec)
+
+Campos: fase, pr (numero o null), mac (air|pro|null), nivel (N1|N2|N3|null),
+        nota, depende (PU11,PU10; vacio lo limpia), rama, poteto (si|no),
+        encargo, titulo
+Fases:  %s
+
+<paquete> es el nombre de la carpeta dentro de la base.
+Base: la variable PLAN_ESTADO_DIR, si no "dir" en ~/.config/plan-estado/config.json
+(relativa a tu carpeta personal si no empieza por /), si no ~/plans.
+"""
+
+FASES = ["decidido", "encargo", "preparando", "enviado", "worker", "cierre-worker",
+         "revision", "ronda", "ci", "cola-e2e", "cadena", "fusionado", "visto",
+         "bloqueado", "descartado"]
+CAMPOS = ["fase", "pr", "mac", "nivel", "nota", "depende", "rama", "poteto", "encargo", "titulo"]
+ETAPAS = {
+    "decidido": (1, "Plan"), "encargo": (1, "Plan"),
+    "preparando": (2, "Arranque"), "enviado": (2, "Arranque"),
+    "worker": (3, "Worker"), "cierre-worker": (3, "Worker"),
+    "revision": (4, "Revisión"), "ronda": (4, "Revisión"),
+    "ci": (5, "CI"),
+    "cola-e2e": (6, "E2E"), "cadena": (6, "E2E"),
+    "fusionado": (7, "Fusionado"), "visto": (7, "Fusionado"),
+}
+
+
+class Error(Exception):
+    pass
+
+
+CONFIG = os.path.expanduser("~/.config/plan-estado/config.json")
+
+
+def base():
+    d = os.environ.get("PLAN_ESTADO_DIR")
+    if not d:
+        try:
+            with open(CONFIG, encoding="utf-8") as f:
+                d = json.load(f).get("dir")
+        except (OSError, ValueError, AttributeError):
+            d = None
+    d = os.path.expanduser(d or "plans")
+    return d if os.path.isabs(d) else os.path.join(os.path.expanduser("~"), d)
+
+
+def ahora():
+    return datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def hoy():
+    return datetime.date.today().strftime("%Y-%m-%d")
+
+
+def ruta_estado(paquete):
+    if not paquete or "/" in paquete or paquete in (".", ".."):
+        raise Error("Nombre de paquete no valido: %r." % paquete)
+    return os.path.join(base(), paquete, "estado.json")
+
+
+@contextmanager
+def candado(carpeta):
+    os.makedirs(carpeta, exist_ok=True)
+    fd = os.open(os.path.join(carpeta, ".plan-estado.lock"), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def leer(ruta):
+    try:
+        with open(ruta, encoding="utf-8") as f:
+            return json.load(f)
+    except ValueError as e:
+        raise Error("El archivo %s no es JSON valido (%s)." % (ruta, e))
+
+
+def escribir(ruta, datos):
+    carpeta = os.path.dirname(ruta)
+    try:
+        modo = os.stat(ruta).st_mode & 0o777
+    except OSError:
+        modo = 0o644
+    fd, tmp = tempfile.mkstemp(prefix=".plan-estado-", suffix=".tmp", dir=carpeta)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(datos, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, modo)
+        os.replace(tmp, ruta)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def parse_pares(args):
+    pares = []
+    for a in args:
+        if "=" not in a:
+            raise Error("Se esperaba campo=valor y llego %r." % a)
+        k, v = a.split("=", 1)
+        pares.append((k.strip(), v))
+    return pares
+
+
+def convertir(campo, valor):
+    nulo = valor.strip().lower() == "null"
+    if campo == "fase":
+        if valor not in FASES:
+            raise Error("Fase no valida %r. Valores: %s." % (valor, ", ".join(FASES)))
+        return valor
+    if campo == "pr":
+        if nulo:
+            return None
+        try:
+            return int(valor)
+        except ValueError:
+            raise Error("pr debe ser un numero entero o null, no %r." % valor)
+    if campo == "mac":
+        if nulo:
+            return None
+        if valor not in ("air", "pro"):
+            raise Error("mac debe ser air, pro o null, no %r." % valor)
+        return valor
+    if campo == "nivel":
+        if nulo:
+            return None
+        if valor not in ("N1", "N2", "N3"):
+            raise Error("nivel debe ser N1, N2, N3 o null, no %r." % valor)
+        return valor
+    if campo == "depende":
+        return [x.strip() for x in valor.split(",") if x.strip()]
+    if campo == "poteto":
+        v = valor.strip().lower()
+        if v in ("si", "sí"):
+            return True
+        if v == "no":
+            return False
+        raise Error("poteto debe ser si o no, no %r." % valor)
+    if campo in ("rama", "encargo"):
+        return None if (nulo or valor == "") else valor
+    return valor  # nota, titulo
+
+
+def aplicar(unidad, pares):
+    if not pares:
+        raise Error("Falta al menos un campo=valor. Campos: %s." % ", ".join(CAMPOS))
+    for k, _ in pares:
+        if k not in CAMPOS:
+            raise Error("Campo desconocido %r. Campos validos: %s." % (k, ", ".join(CAMPOS)))
+    for k, v in pares:
+        poner(unidad, k, convertir(k, v))
+
+
+def poner(d, k, v):
+    """Asigna conservando el orden; una clave nueva entra antes de nota/actualizado."""
+    if k in d:
+        d[k] = v
+        return
+    items = list(d.items())
+    pos = len(items)
+    for ancla in ("nota", "actualizado"):
+        for i, (kk, _) in enumerate(items):
+            if kk == ancla:
+                pos = i
+                break
+        else:
+            continue
+        break
+    items.insert(pos, (k, v))
+    d.clear()
+    d.update(items)
+
+
+def cargar_estado(paquete):
+    ruta = ruta_estado(paquete)
+    if not os.path.isfile(ruta):
+        raise Error("No existe %s. Para crearlo: plan-estado %s --crear \"<titulo>\"." % (ruta, paquete))
+    return ruta, leer(ruta)
+
+
+def cmd_unidad(paquete, uid, pares):
+    ruta = ruta_estado(paquete)
+    if not os.path.isfile(ruta):
+        raise Error("No existe %s. Para crearlo: plan-estado %s --crear \"<titulo>\"." % (ruta, paquete))
+    with candado(os.path.dirname(ruta)):
+        ruta, est = cargar_estado(paquete)
+        unidad = next((u for u in est.get("unidades", []) if u.get("id") == uid), None)
+        if unidad is None:
+            raise Error("No existe la unidad %s en %s. Para agregarla: plan-estado %s --nueva %s \"<titulo>\"."
+                        % (uid, paquete, paquete, uid))
+        aplicar(unidad, pares)
+        t = ahora()
+        poner(unidad, "actualizado", t)
+        poner(est, "actualizado", t)
+        escribir(ruta, est)
+    print("%s/%s actualizada." % (paquete, uid))
+
+
+def cmd_nueva(paquete, uid, titulo, pares):
+    ruta = ruta_estado(paquete)
+    if not os.path.isfile(ruta):
+        raise Error("No existe %s. Para crearlo: plan-estado %s --crear \"<titulo>\"." % (ruta, paquete))
+    with candado(os.path.dirname(ruta)):
+        ruta, est = cargar_estado(paquete)
+        if any(u.get("id") == uid for u in est.get("unidades", [])):
+            raise Error("La unidad %s ya existe en %s." % (uid, paquete))
+        t = ahora()
+        unidad = {"id": uid, "titulo": titulo, "fase": "decidido", "mac": None, "poteto": False,
+                  "rama": None, "pr": None, "depende": [], "encargo": None, "nivel": None,
+                  "nota": "", "actualizado": t}
+        if pares:
+            aplicar(unidad, pares)
+        est.setdefault("unidades", []).append(unidad)
+        poner(est, "actualizado", t)
+        escribir(ruta, est)
+    print("%s/%s creada." % (paquete, uid))
+
+
+def cmd_crear(paquete, titulo):
+    ruta = ruta_estado(paquete)
+    with candado(os.path.dirname(ruta)):
+        if os.path.exists(ruta):
+            raise Error("Ya existe %s." % ruta)
+        escribir(ruta, {"version": 1, "paquete": paquete, "titulo": titulo, "estado": "activo",
+                        "artefactos": [], "unidades": [], "actualizado": ahora()})
+    print("Creado %s." % ruta)
+
+
+def cmd_cerrar(paquete):
+    ruta = ruta_estado(paquete)
+    if not os.path.isfile(ruta):
+        raise Error("No existe %s." % ruta)
+    with candado(os.path.dirname(ruta)):
+        ruta, est = cargar_estado(paquete)
+        poner(est, "estado", "cerrado")
+        poner(est, "actualizado", ahora())
+        escribir(ruta, est)
+    print("%s cerrado." % paquete)
+
+
+def upsert(lista, url, entrada):
+    """Reemplaza el elemento con esa url conservando su posicion, o agrega al final."""
+    for i, e in enumerate(lista):
+        if e.get("url") == url:
+            lista[i] = entrada
+            return e
+    lista.append(entrada)
+    return None
+
+
+def cmd_decision(url, tipo, titulo, pares):
+    if tipo not in ("pendiente", "decidida"):
+        raise Error("El estado de la decision debe ser pendiente o decidida, no %r." % tipo)
+    paquete = None
+    nota = None
+    for k, v in pares:
+        if k == "paquete":
+            paquete = v if v and v.lower() != "null" else None
+        elif k == "nota":
+            nota = v
+        else:
+            raise Error("Campo desconocido %r. Campos validos: paquete, nota." % k)
+    carpeta = base()
+    rd = os.path.join(carpeta, "decisiones.json")
+    if not os.path.isfile(rd):
+        raise Error("No existe %s." % rd)
+    with candado(carpeta):
+        dec = leer(rd)
+        pend = dec.setdefault("pendientes", [])
+        deci = dec.setdefault("decididas", [])
+        prev_p = next((e for e in pend if e.get("url") == url), None)
+        prev_d = next((e for e in deci if e.get("url") == url), None)
+        prev = prev_p or prev_d or {}
+        pq = paquete if paquete is not None else prev.get("paquete")
+        nt = nota if nota is not None else prev.get("nota", "")
+        if tipo == "pendiente":
+            desde = (prev_p or {}).get("desde") or hoy()
+            upsert(pend, url, {"titulo": titulo, "url": url, "desde": desde, "paquete": pq, "nota": nt})
+            deci[:] = [e for e in deci if e.get("url") != url]
+        else:
+            pend[:] = [e for e in pend if e.get("url") != url]
+            upsert(deci, url, {"titulo": titulo, "url": url, "fecha": hoy(), "paquete": pq, "nota": nt})
+        poner(dec, "actualizado", ahora())
+        art = None
+        if paquete:
+            rp = ruta_estado(paquete)
+            if os.path.isfile(rp):
+                art = rp
+        if art:
+            with candado(os.path.dirname(art)):
+                est = leer(art)
+                lista = est.setdefault("artefactos", [])
+                viejo = next((e for e in lista if e.get("url") == url), None)
+                resumen = nota if nota is not None else (viejo or {}).get("resumen", "")
+                upsert(lista, url, {"titulo": titulo, "url": url, "decision": tipo,
+                                    "fecha": hoy(), "resumen": resumen})
+                poner(est, "actualizado", ahora())
+                escribir(art, est)
+        escribir(rd, dec)
+    print("Decision %s: %s." % (tipo, titulo))
+    if paquete and not art:
+        print("Aviso: %s no tiene estado.json, no se toco ningun paquete." % paquete, file=sys.stderr)
+
+
+def etapa(fase):
+    if fase in ETAPAS:
+        n, nombre = ETAPAS[fase]
+        return "%s · %d/7 %s" % (fase, n, nombre)
+    return fase
+
+
+def mostrar(est, carpeta):
+    print("%s  (%s/)" % (est.get("titulo", est.get("paquete", carpeta)), carpeta))
+    arts = est.get("artefactos") or []
+    for a in arts:
+        print("  artefacto [%s] %s  %s" % (a.get("decision", "?"), a.get("titulo", ""), a.get("url", "")))
+    unids = est.get("unidades") or []
+    if not unids:
+        print("  (sin unidades)")
+    for u in unids:
+        dep = ",".join(u.get("depende") or []) or "-"
+        pr = u.get("pr")
+        linea = "  %s  %s  mac=%s  poteto=%s  PR=%s  depende=%s" % (
+            u.get("id", "?"), etapa(u.get("fase", "?")), u.get("mac") or "-",
+            "si" if u.get("poteto") else "no", ("#%s" % pr) if pr is not None else "-", dep)
+        print(linea)
+        if u.get("nota"):
+            print("      %s" % u["nota"])
+    print("")
+
+
+def cmd_ver(paquete):
+    b = base()
+    if paquete:
+        _, est = cargar_estado(paquete)
+        mostrar(est, paquete)
+    else:
+        if not os.path.isdir(b):
+            raise Error("No existe la carpeta base %s." % b)
+        for nombre in sorted(os.listdir(b)):
+            ruta = os.path.join(b, nombre, "estado.json")
+            if not os.path.isfile(ruta):
+                continue
+            est = leer(ruta)
+            if est.get("estado") == "cerrado":
+                continue
+            mostrar(est, nombre)
+        rd = os.path.join(b, "decisiones.json")
+        n = 0
+        if os.path.isfile(rd):
+            n = len(leer(rd).get("pendientes") or [])
+        print("Decisiones pendientes: %d" % n)
+
+
+def sacar_on(args):
+    if "--on" not in args:
+        return None, args
+    i = args.index("--on")
+    if i + 1 >= len(args):
+        raise Error("--on necesita el nombre de la maquina.")
+    maq = args[i + 1]
+    return maq, args[:i] + args[i + 2:]
+
+
+def correr_en(maq, args):
+    hc = "hc"
+    for d in (os.path.expanduser("~/.local/bin"),):
+        if os.path.exists(os.path.join(d, "hc")):
+            hc = os.path.join(d, "hc")
+    try:
+        return subprocess.call([hc, "exec", "--on", maq, "--", "plan-estado"] + args)
+    except OSError as e:
+        raise Error("No se pudo correr hc (%s)." % e)
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USO % ", ".join(FASES))
+        return 0
+    maq, argv = sacar_on(argv)
+    if maq:
+        if not argv:
+            raise Error("Falta el comando para correr en %s." % maq)
+        return correr_en(maq, argv)
+    if argv[0] == "ver":
+        if len(argv) > 2:
+            raise Error("Uso: plan-estado ver [<paquete>]")
+        cmd_ver(argv[1] if len(argv) == 2 else None)
+        return 0
+    if argv[0] == "decision":
+        if len(argv) < 4:
+            raise Error("Uso: plan-estado decision <url> pendiente|decidida \"<titulo>\" [paquete=...] [nota=\"...\"]")
+        cmd_decision(argv[1], argv[2], argv[3], parse_pares(argv[4:]))
+        return 0
+    paquete = argv[0]
+    if len(argv) < 2:
+        raise Error("Falta el comando. Mira plan-estado --help.")
+    op = argv[1]
+    if op == "--crear":
+        if len(argv) != 3:
+            raise Error("Uso: plan-estado <paquete> --crear \"<titulo>\"")
+        cmd_crear(paquete, argv[2])
+    elif op == "--cerrar":
+        if len(argv) != 2:
+            raise Error("Uso: plan-estado <paquete> --cerrar")
+        cmd_cerrar(paquete)
+    elif op == "--nueva":
+        if len(argv) < 4:
+            raise Error("Uso: plan-estado <paquete> --nueva <unidad> \"<titulo>\" [campo=valor...]")
+        cmd_nueva(paquete, argv[2], argv[3], parse_pares(argv[4:]))
+    elif op.startswith("--"):
+        raise Error("Opcion desconocida %s. Mira plan-estado --help." % op)
+    else:
+        cmd_unidad(paquete, op, parse_pares(argv[2:]))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Error as e:
+        print("Error: %s" % e, file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)

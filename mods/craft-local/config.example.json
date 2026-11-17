@@ -1,0 +1,5 @@
+{
+  "vm": "mac-ci",
+  "repo": "your-user/your-repo",
+  "runnerLabel": "mac-ci"
+}

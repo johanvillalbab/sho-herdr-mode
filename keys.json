@@ -1,0 +1,19 @@
+{
+  "global": {
+    "cmd-w": "mod.open:tab-guard",
+    "cmd-shift-w": "mod.open:pane-guard"
+  },
+  "mod:tab-guard": {
+    "cmd-w": "tab-guard.confirm"
+  },
+  "mod:pane-guard": {
+    "cmd-shift-w": "pane-guard.confirm"
+  },
+  "layout:main-craft": {
+    "cmd-alt-b": "layout.toggle:panel",
+    "cmd-g": "craft-tabs.graph",
+    "cmd-shift-n": "craft-tabs.notes",
+    "cmd-shift-i": "craft-tabs.issues",
+    "cmd-shift-o": "craft-tabs.plans"
+  }
+}
